@@ -13,6 +13,7 @@
    Get-VulnerableGPO
 .EXAMPLE
    Get-VulnerableGPO -Domain cpandl.com
+   use this command to get the vul gpo
 #>
 
 Add-Type -AssemblyName System.DirectoryServices.Protocols
