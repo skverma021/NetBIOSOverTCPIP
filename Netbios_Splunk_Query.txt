@@ -1,0 +1,17 @@
+(
+  search index=windows sourcetype="WMI:Win32_NetworkAdapterConfiguration" TcpipNetbiosOptions=*
+  | eval NetBIOS_Status=case(
+      TcpipNetbiosOptions==0, "Default",
+      TcpipNetbiosOptions==1, "Enabled",
+      TcpipNetbiosOptions==2, "Disabled",
+      true(), "Unknown"
+  )
+  | fields host NetBIOS_Status
+)
+OR
+(
+  search index=windows sourcetype="WMI:Win32_ShadowCopy"
+  | eval ShadowCopy_Status="Available"
+  | fields host ShadowCopy_Status
+)
+| stats values(NetBIOS_Status) as NetBIOS_Status values(ShadowCopy_Status) as ShadowCopy_Status by host
