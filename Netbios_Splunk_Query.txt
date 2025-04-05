@@ -15,3 +15,14 @@ OR
   | fields host ShadowCopy_Status
 )
 | stats values(NetBIOS_Status) as NetBIOS_Status values(ShadowCopy_Status) as ShadowCopy_Status by host
+
+
+(index=* OR index=_*) 
+(sourcetype="WinEventLog:System" OR sourcetype="WinEventLog:Security") 
+(EventCode=4688 OR EventCode=4624 OR EventCode=4625) 
+| eval netbios_status=if(match(_raw, "(Netbios over Tcpip|NetBIOS over TCP/IP)"), "NetBIOS Enabled", "NetBIOS Disabled") 
+| eval shadowcopy_limit_status=if(match(_raw, "Shadow Copy Limit"), "Shadow Copy Limit Found", "Shadow Copy Limit Not Found") 
+| stats values(netbios_status) as NetBIOS_Status, values(shadowcopy_limit_status) as ShadowCopy_Limit_Status by host 
+| eval NetBIOS_Status=mvjoin(NetBIOS_Status, ", ")
+| eval ShadowCopy_Limit_Status=mvjoin(ShadowCopy_Limit_Status, ", ")
+
