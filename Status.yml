@@ -1,0 +1,34 @@
+- name: Collect NetBIOS and Shadow Copy status from Windows servers
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+    - name: Copy script to remote servers
+      win_copy:
+        src: ./get_netbios_shadow_simple.ps1
+        dest: C:\Temp\get_netbios_shadow_simple.ps1
+
+    - name: Run script on remote servers
+      win_shell: powershell -ExecutionPolicy Bypass -File C:\Temp\get_netbios_shadow_simple.ps1
+      register: server_status_raw
+
+    - name: Assemble results from all hosts
+      set_fact:
+        combined_results: "{{ combined_results | default([]) + [ server_status_raw.stdout | from_json ] }}"
+
+    - name: Print consolidated Windows Server Status Report
+      run_once: true
+      delegate_to: localhost
+      vars:
+        header: "| Host         | NetBIOS Status  | ShadowCopy Status                | Last Checked        |\n|--------------|-----------------|----------------------------------|---------------------|"
+      block:
+        - name: Print header
+          debug:
+            msg: "{{ header }}"
+
+        - name: Print table rows
+          debug:
+            msg: >-
+              {% for row in combined_results %}
+              | {{ row.Host | ljust(12) }} | {{ row.NetBIOS_Status | ljust(15) }} | {{ row.ShadowCopy_Status | truncate(30, True) | ljust(32) }} | {{ row.Last_Checked }} |
+              {% endfor %}
