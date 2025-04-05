@@ -1,0 +1,286 @@
+---
+- name: Collect NetBIOS and Shadow Copy Status Across All Servers
+  hosts: windows_servers  # Adjust to your inventory group
+  gather_facts: false
+
+  tasks:
+    - name: Create centralized report directory
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.file:
+        path: "/ansible_reports/Server_Status"
+        state: directory
+        mode: '0755'
+
+    - name: Get system information
+      block:
+        - name: Get computer and domain info
+          ansible.windows.win_command: |
+            powershell -command "& {
+                $cs = Get-WmiObject -Class Win32_ComputerSystem
+                $os = Get-CimInstance Win32_OperatingSystem
+                [PSCustomObject]@{
+                    ComputerName = $env:COMPUTERNAME
+                    Domain = $cs.Domain
+                    OSCaption = $os.Caption
+                    OSVersion = $os.Version
+                } | ConvertTo-Json -Compress
+            }"
+          register: system_info
+
+        - name: Set system facts
+          set_fact:
+            computer_name: "{{ (system_info.stdout | from_json).ComputerName }}"
+            domain: "{{ (system_info.stdout | from_json).Domain }}"
+            os_caption: "{{ (system_info.stdout | from_json).OSCaption }}"
+            os_version: "{{ (system_info.stdout | from_json).OSVersion }}"
+
+    - name: Determine server version
+      set_fact:
+        server_version: >-
+          {% if os_version is match('6.2.*') %}2012
+          {% elif os_version is match('6.3.*') %}2012 R2
+          {% elif os_version is match('10.0.14393.*') %}2016
+          {% elif os_version is match('10.0.17763.*') %}2019
+          {% elif os_version is match('10.0.20348.*') %}2022
+          {% else %}Unsupported{% endif %}
+
+    - name: Check NetBIOS status
+      block:
+        - name: Get NetBIOS adapter configurations
+          ansible.windows.win_command: |
+            powershell -command "& {
+                $adapters = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration | 
+                    Where-Object { $_.TcpipnetbiosOptions -ne 2 } |
+                    Select-Object Description, TcpipnetbiosOptions
+                [PSCustomObject]@{
+                    NetBIOSEnabled = ($adapters -ne $null)
+                    Adapters = $adapters
+                } | ConvertTo-Json -Depth 5 -Compress
+            }"
+          register: netbios_info
+
+        - name: Set NetBIOS facts
+          set_fact:
+            netbios_status: >-
+              {% if (netbios_info.stdout | from_json).NetBIOSEnabled %}Enabled
+              {% else %}Disabled{% endif %}
+            netbios_adapters: "{{ (netbios_info.stdout | from_json).Adapters }}"
+
+    - name: Check Shadow Copy status
+      block:
+        - name: Get shadow storage info
+          ansible.windows.win_command: |
+            powershell -command "& {
+                $shadowStorage = Get-WmiObject Win32_ShadowStorage | ForEach-Object {
+                    $vol = Get-WmiObject -Query ('SELECT * FROM Win32_Volume WHERE __RELPATH = \"' + $_.Volume + '\"')
+                    $diffVol = Get-WmiObject -Query ('SELECT * FROM Win32_Volume WHERE __RELPATH = \"' + $_.DiffVolume + '\"')
+                    [PSCustomObject]@{
+                        Volume = $vol.Name
+                        DiffVolume = $diffVol.Name
+                        MaxSpace = $_.MaxSpace
+                        Capacity = $diffVol.Capacity
+                        Percent = [Math]::Min(100, [int64]($_.MaxSpace/$diffVol.Capacity * 100))
+                    }
+                }
+                $shadowCount = (Get-WmiObject Win32_ShadowCopy | Measure-Object).Count
+                [PSCustomObject]@{
+                    Configured = ($shadowStorage -ne $null)
+                    ShadowCount = $shadowCount
+                    Storage = $shadowStorage
+                } | ConvertTo-Json -Depth 5 -Compress
+            }"
+          register: shadow_info
+
+        - name: Set Shadow Copy facts
+          set_fact:
+            shadow_configured: "{{ (shadow_info.stdout | from_json).Configured }}"
+            shadow_count: "{{ (shadow_info.stdout | from_json).ShadowCount }}"
+            shadow_storage: "{{ (shadow_info.stdout | from_json).Storage }}"
+
+    - name: Generate server CSV entry
+      set_fact:
+        server_csv_entry: >-
+          {{ computer_name }},{{ domain }},{{ os_caption }},{{ os_version }},{{ server_version }},
+          {{ netbios_status }},{{ shadow_configured }},{{ shadow_count }},
+          "{{ netbios_adapters | default([]) | length }}","{{ shadow_storage | default([]) | to_json | replace('"', '""') }}"
+
+    - name: Save individual server data to centralized CSV
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: "/ansible_reports/Server_Status/server_status.csv"
+        line: "{{ server_csv_entry }}"
+        create: true
+        insertbefore: BOF
+        line_regex: '^{{ computer_name }},'
+      run_once: true
+      when: inventory_hostname == play_hosts[0]
+
+    - name: Append server data to CSV
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: "/ansible_reports/Server_Status/server_status.csv"
+        line: "{{ server_csv_entry }}"
+        insertafter: EOF
+      when: inventory_hostname != play_hosts[0]
+
+- name: Generate HTML Dashboard
+  hosts: localhost
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Read CSV data
+      ansible.builtin.slurp:
+        src: "/ansible_reports/Server_Status/server_status.csv"
+      register: csv_data
+
+    - name: Convert CSV to list
+      set_fact:
+        server_data: >-
+          {% set raw_data = (csv_data.content | b64decode).split('\n') | reject('equalto', '') | list %}
+          {% for line in raw_data %}
+          {% set fields = line.split(',') %}
+          {
+            "hostname": fields[0],
+            "domain": fields[1],
+            "os": fields[2],
+            "os_version": fields[3],
+            "server_version": fields[4],
+            "netbios_status": fields[5],
+            "shadow_configured": fields[6],
+            "shadow_count": fields[7],
+            "netbios_adapters": fields[8] | int,
+            "shadow_storage": fields[9][1:-1] | from_json | default([])
+          }{% if not loop.last %},{% endif %}
+          {% endfor %}
+
+    - name: Generate HTML dashboard
+      ansible.builtin.template:
+        src: |
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Server Status Dashboard</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 20px; }
+                  h1 { color: #2c3e50; }
+                  table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+                  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                  th { background-color: #3498db; color: white; }
+                  tr:nth-child(even) { background-color: #f2f2f2; }
+                  .enabled { color: green; }
+                  .disabled { color: red; }
+                  .details { background-color: #f9f9f9; padding: 10px; margin: 10px 0; }
+                  .tab { overflow: hidden; border: 1px solid #ccc; background-color: #f1f1f1; }
+                  .tab button { background-color: inherit; float: left; border: none; outline: none; cursor: pointer; padding: 14px 16px; transition: 0.3s; }
+                  .tab button:hover { background-color: #ddd; }
+                  .tab button.active { background-color: #3498db; color: white; }
+                  .tabcontent { display: none; padding: 6px 12px; border: 1px solid #ccc; border-top: none; }
+                  .summary { margin-bottom: 20px; font-size: 1.1em; }
+              </style>
+          </head>
+          <body>
+              <h1>Server Status Dashboard</h1>
+              <p class="summary">Generated on {{ ansible_date_time.iso8601 }}</p>
+              
+              <div class="summary">
+                  <strong>Summary:</strong><br>
+                  Total Servers: {{ server_data | length }}<br>
+                  Servers with NetBIOS Enabled: {{ server_data | selectattr('netbios_status', 'equalto', 'Enabled') | list | length }}<br>
+                  Servers with Shadow Copies Configured: {{ server_data | selectattr('shadow_configured', 'equalto', 'True') | list | length }}
+              </div>
+              
+              <div class="tab">
+                  <button class="tablinks active" onclick="openTab(event, 'Overview')">Overview</button>
+                  <button class="tablinks" onclick="openTab(event, 'NetBIOS')">NetBIOS Status</button>
+                  <button class="tablinks" onclick="openTab(event, 'ShadowCopy')">Shadow Copy Status</button>
+              </div>
+              
+              <div id="Overview" class="tabcontent" style="display: block;">
+                  <h2>Server Overview</h2>
+                  <table>
+                      <tr>
+                          <th>Hostname</th>
+                          <th>Domain</th>
+                          <th>OS</th>
+                          <th>Server Version</th>
+                          <th>NetBIOS</th>
+                          <th>Shadow Copies</th>
+                          <th>Shadow Count</th>
+                      </tr>
+                      {% for server in server_data %}
+                      <tr>
+                          <td>{{ server.hostname }}</td>
+                          <td>{{ server.domain }}</td>
+                          <td>{{ server.os }}</td>
+                          <td>{{ server.server_version }}</td>
+                          <td class="{% if server.netbios_status == 'Enabled' %}enabled{% else %}disabled{% endif %}">
+                              {{ server.netbios_status }}
+                          </td>
+                          <td class="{% if server.shadow_configured == 'True' %}enabled{% else %}disabled{% endif %}">
+                              {{ server.shadow_configured }}
+                          </td>
+                          <td>{{ server.shadow_count }}</td>
+                      </tr>
+                      {% endfor %}
+                  </table>
+              </div>
+              
+              <div id="NetBIOS" class="tabcontent">
+                  <h2>NetBIOS Status Details</h2>
+                  {% for server in server_data %}
+                  {% if server.netbios_status == 'Enabled' %}
+                  <div class="details">
+                      <h3>{{ server.hostname }}</h3>
+                      <p>NetBIOS enabled on {{ server.netbios_adapters }} adapter(s)</p>
+                  </div>
+                  {% endif %}
+                  {% endfor %}
+              </div>
+              
+              <div id="ShadowCopy" class="tabcontent">
+                  <h2>Shadow Copy Details</h2>
+                  {% for server in server_data %}
+                  {% if server.shadow_configured == 'True' %}
+                  <div class="details">
+                      <h3>{{ server.hostname }}</h3>
+                      <p>Shadow Copies: {{ server.shadow_count }}</p>
+                      <table>
+                          <tr>
+                              <th>Volume</th>
+                              <th>Storage Volume</th>
+                              <th>Max Space</th>
+                              <th>Percentage</th>
+                          </tr>
+                          {% for storage in server.shadow_storage %}
+                          <tr>
+                              <td>{{ storage.Volume }}</td>
+                              <td>{{ storage.DiffVolume }}</td>
+                              <td>{{ storage.MaxSpace | filesizeformat }}</td>
+                              <td>{{ storage.Percent }}%</td>
+                          </tr>
+                          {% endfor %}
+                      </table>
+                  </div>
+                  {% endif %}
+                  {% endfor %}
+              </div>
+              
+              <script>
+                  function openTab(evt, tabName) {
+                      var i, tabcontent, tablinks;
+                      tabcontent = document.getElementsByClassName("tabcontent");
+                      for (i = 0; i < tabcontent.length; i++) {
+                          tabcontent[i].style.display = "none";
+                      }
+                      tablinks = document.getElementsByClassName("tablinks");
+                      for (i = 0; i < tablinks.length; i++) {
+                          tablinks[i].className = tablinks[i].className.replace(" active", "");
+                      }
+                      document.getElementById(tabName).style.display = "block";
+                      evt.currentTarget.className += " active";
+                  }
+              </script>
+          </body>
+          </html>
+        dest: "/ansible_reports/Server_Status/server_dashboard.html"
