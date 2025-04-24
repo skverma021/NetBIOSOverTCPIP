@@ -1,0 +1,97 @@
+<#
+.SYNOPSIS
+Creates a scheduled task on multiple remote computers to copy a PowerShell script and run it weekly.
+
+.DESCRIPTION
+This script reads a list of computer names from a text file, connects to each remote computer,
+copies a specified PowerShell script to the I:\ drive of that computer, and then creates a scheduled
+task to run the copied script every Monday at 12:00 AM. The scheduled task will have the name
+"CNRYcleanUp" and the description "engineer sync schedule task".
+
+.PARAMETER ComputerListPath
+The full path to the text file containing a list of remote computer names (one name per line).
+
+.PARAMETER ScriptToCopyPath
+The full path to the PowerShell script file that needs to be copied to the remote computers.
+
+.EXAMPLE
+.\Create-RemoteScheduledTask.ps1 -ComputerListPath "C:\Temp\Computers.txt" -ScriptToCopyPath "C:\Scripts\Cleanup.ps1"
+
+.NOTES
+- Ensure you have the necessary administrative privileges on the remote computers to perform these actions.
+- The script assumes the I:\ drive exists on all remote computers. Adjust the destination path if needed.
+- Error handling for network connectivity and remote execution is included.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$ComputerListPath,
+
+    [Parameter(Mandatory=$true)]
+    [string]$ScriptToCopyPath
+)
+
+# Check if the computer list file exists
+if (-not (Test-Path -Path $ComputerListPath -PathType Leaf)) {
+    Write-Error "Error: Computer list file not found at '$ComputerListPath'."
+    exit 1
+}
+
+# Check if the script to copy exists
+if (-not (Test-Path -Path $ScriptToCopyPath -PathType Leaf)) {
+    Write-Error "Error: Script file not found at '$ScriptToCopyPath'."
+    exit 1
+}
+
+# Read the list of computer names from the file
+$ComputerNames = Get-Content -Path $ComputerListPath
+
+# Define the destination path for the script on the remote computers
+$RemoteScriptPath = "\\$($env:COMPUTERNAME)\C$\CNRYcleanUp.ps1" # Copy to C:\ initially for easier access in the task
+
+# Define the scheduled task name and description
+$TaskName = "CNRYcleanUp"
+$TaskDescription = "engineer sync schedule task"
+$TaskActionName = "Run Cleanup Script"
+
+# Loop through each computer name
+foreach ($ComputerName in $ComputerNames) {
+    Write-Host "Processing computer: $ComputerName"
+
+    # Construct the remote file path for the I drive
+    $RemoteDestinationPath = "\\$ComputerName\I$\"
+    $FinalRemoteScriptPath = Join-Path -Path $RemoteDestinationPath -ChildPath (Split-Path -Leaf $ScriptToCopyPath)
+
+    # Copy the script to the remote computer's I drive
+    try {
+        Copy-Item -Path $ScriptToCopyPath -Destination $RemoteDestinationPath -Force
+        Write-Host "Successfully copied '$($ScriptToCopyPath)' to '$RemoteDestinationPath' on '$ComputerName'."
+    }
+    catch {
+        Write-Error "Error copying script to '$ComputerName': $($_.Exception.Message)"
+        continue # Move to the next computer if copying fails
+    }
+
+    # Define the action to execute the copied script
+    $TaskAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$FinalRemoteScriptPath`"" -WorkingDirectory $RemoteDestinationPath
+
+    # Define the trigger to run the task every Monday at 12:00 AM
+    $TaskTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At 12:00am
+
+    # Define the principal to run the task (using the default)
+    $TaskPrincipal = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -RunLevel Highest
+
+    # Create the scheduled task options
+    $TaskSettings = New-ScheduledTaskSettingsSet -AllowDemandStart -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable
+
+    # Register the scheduled task on the remote computer
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $TaskAction -Trigger $TaskTrigger -Principal $TaskPrincipal -Settings $TaskSettings -Description $TaskDescription -ComputerName $ComputerName
+        Write-Host "Successfully created scheduled task '$TaskName' on '$ComputerName'."
+    }
+    catch {
+        Write-Error "Error creating scheduled task on '$ComputerName': $($_.Exception.Message)"
+    }
+}
+
+Write-Host "Script execution completed."
