@@ -1,0 +1,104 @@
+<#
+.SYNOPSIS
+Creates a scheduled task on multiple remote hosts and copies a PowerShell script to their I:\ drive.
+
+.DESCRIPTION
+This script takes a list of remote computer names, the path to a PowerShell script,
+the name for the scheduled task, the action to execute (e.g., running the script),
+and a schedule (e.g., daily at a specific time). It then connects to each remote
+computer, copies the script to the I:\ drive, and creates a scheduled task to
+execute the script based on the provided schedule.
+
+.PARAMETER ComputerName
+A string array of remote computer names where the scheduled task will be created.
+
+.PARAMETER ScriptPath
+The full path to the PowerShell script that needs to be copied and executed.
+
+.PARAMETER TaskName
+The name you want to give to the scheduled task on the remote computers.
+
+.PARAMETER Action
+The action to be performed by the scheduled task. Typically, this will involve
+running the copied PowerShell script. For example:
+'powershell.exe -NoProfile -ExecutionPolicy Bypass -File I:\YourScript.ps1'
+
+.PARAMETER Schedule
+A CimInstance object representing the schedule for the task. You can create
+schedule objects using cmdlets like New-ScheduledTaskTrigger (e.g., for a daily
+schedule: New-ScheduledTaskTrigger -Daily -At 09:00).
+
+.EXAMPLE
+# Create a daily scheduled task named "MyDailyScript" on server01 and server02
+# to run the script located at C:\Scripts\MyScript.ps1 at 9:00 AM.
+$Computers = "server01", "server02"
+$ScriptPath = "C:\Scripts\MyScript.ps1"
+$TaskName = "MyDailyScript"
+$Action = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File I:\MyScript.ps1'
+$Schedule = New-ScheduledTaskTrigger -Daily -At 09:00
+
+.\CreateRemoteTask.ps1 -ComputerName $Computers -ScriptPath $ScriptPath -TaskName $TaskName -Action $Action -Schedule $Schedule
+
+.NOTES
+- Ensure you have the necessary administrative privileges on the remote computers.
+- The I:\ drive must exist on the remote computers.
+- Adjust the 'Action' parameter to match how you want to execute the script.
+- Error handling for file copy and task creation is included.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string[]]$ComputerName,
+
+    [Parameter(Mandatory=$true)]
+    [string]$ScriptPath,
+
+    [Parameter(Mandatory=$true)]
+    [string]$TaskName,
+
+    [Parameter(Mandatory=$true)]
+    [string]$Action,
+
+    [Parameter(Mandatory=$true)]
+    [System.Object]$Schedule
+)
+
+foreach ($Computer in $ComputerName) {
+    Write-Host "Processing computer: $Computer"
+
+    # Define the destination path on the remote computer
+    $DestinationPath = "\\$Computer\C$\I\$((Split-Path $ScriptPath -Leaf))"
+    $RemoteIDrive = "\\$Computer\I$"
+
+    # Copy the script to the remote I:\ drive
+    Write-Host "Copying '$ScriptPath' to '$RemoteIDrive' on '$Computer'..."
+    try {
+        Copy-Item -Path $ScriptPath -Destination $RemoteIDrive -ErrorAction Stop
+        Write-Host "Successfully copied '$((Split-Path $ScriptPath -Leaf))' to '$Computer\I:\'."
+    }
+    catch {
+        Write-Error "Failed to copy '$ScriptPath' to '$Computer\I:\': $($_.Exception.Message)"
+        continue # Move to the next computer if copying fails
+    }
+
+    # Define the task action
+    $TaskAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File I\$((Split-Path $ScriptPath -Leaf))"
+
+    # Define the task principal (run as Local System with highest privileges)
+    $TaskPrincipal = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+    # Define the task settings
+    $TaskSettings = New-ScheduledTaskSettingsSet -AllowDemandStart -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable
+
+    # Register the scheduled task on the remote computer
+    Write-Host "Creating scheduled task '$TaskName' on '$Computer'..."
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $TaskAction -Trigger $Schedule -Principal $TaskPrincipal -Settings $TaskSettings -ComputerName $Computer -ErrorAction Stop
+        Write-Host "Successfully created scheduled task '$TaskName' on '$Computer'."
+    }
+    catch {
+        Write-Error "Failed to create scheduled task '$TaskName' on '$Computer': $($_.Exception.Message)"
+    }
+}
+
+Write-Host "Script execution completed."
