@@ -1,0 +1,72 @@
+<#
+.SYNOPSIS
+  Retrieves the OU of servers listed in a text file and checks if the 'wsus_gpo' is applied.
+
+.DESCRIPTION
+  This script reads a list of server names from a specified text file.
+  For each server, it connects remotely to determine its Organizational Unit (OU)
+  and then checks if a Group Policy Object (GPO) named 'wsus_gpo' is applied.
+  The results are displayed on the console.
+
+.PARAMETER ServerListFile
+  Specifies the path to the text file containing a list of server names (one server per line).
+
+.EXAMPLE
+  .\Get-ServerOUAndWSUSGPO.ps1 -ServerListFile "C:\ServerList.txt"
+
+.NOTES
+  - This script requires Remote Management (WinRM) to be enabled on the target servers.
+  - You need appropriate permissions to query Active Directory and Group Policy information on the target servers.
+#>
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$ServerListFile
+)
+
+# Check if the server list file exists
+if (-not (Test-Path $ServerListFile)) {
+    Write-Error "Error: Server list file '$ServerListFile' not found."
+    exit 1
+}
+
+# Read the list of servers from the file
+$Servers = Get-Content $ServerListFile
+
+# Loop through each server
+foreach ($Server in $Servers) {
+    Write-Host "Processing server: $($Server)"
+
+    # Get the server's operating system information to determine the OU
+    try {
+        $ComputerInfo = Invoke-Command -ComputerName $Server -ScriptBlock {
+            Get-WmiObject -Class Win32_OperatingSystem | Select-Object -ExpandProperty CSName, OrganizationalUnit
+        } -ErrorAction Stop
+
+        $OU = $ComputerInfo.OrganizationalUnit
+        Write-Host "  OU: $($OU)"
+    }
+    catch {
+        Write-Warning "  Error getting OU for $($Server): $($_.Exception.Message)"
+        $OU = "N/A"
+    }
+
+    # Check if the 'wsus_gpo' is applied to the server
+    try {
+        $GPOResult = Invoke-Command -ComputerName $Server -ScriptBlock {
+            Get-GPResultantSetOfPolicy -ReportType XML -ComputerName $env:COMPUTERNAME -ErrorAction SilentlyContinue | Select-Object -ExpandProperty RSOPData
+        } -ErrorAction Stop
+
+        if ($GPOResult -like "*<Name>wsus_gpo</Name>*") {
+            Write-Host "  WSUS GPO 'wsus_gpo': Applied"
+        } else {
+            Write-Host "  WSUS GPO 'wsus_gpo': Not Applied"
+        }
+    }
+    catch {
+        Write-Warning "  Error checking WSUS GPO for $($Server): $($_.Exception.Message)"
+    }
+
+    Write-Host "---"
+}
+
+Write-Host "Script execution complete."
