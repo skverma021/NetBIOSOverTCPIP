@@ -972,11 +972,12 @@ try {
         $Results | Export-Csv -Path $OutputCsvFile -NoTypeInformation -Encoding UTF8
 
         Write-Host "`nRegistry compliance report saved to '$OutputCsvFile'"
+        # Corrected way to get counts, ensuring 0 is displayed for empty categories
         Write-Host "Total checks performed: $($Results.Count)"
-        Write-Host "Compliant: $($Results | Where-Object { $_.Status -eq 'Compliant' }).Count"
-        Write-Host "Non-Compliant: $($Results | Where-Object { $_.Status -eq 'Non-Compliant' }).Count"
-        Write-Host "Non-Configured: $($Results | Where-Object { $_.Status -eq 'Non-Configured' }).Count"
-        Write-Host "Errors encountered: $($Results | Where-Object { $_.Status -eq 'Error' }).Count"
+        Write-Host "Compliant: $(($Results | Where-Object { $_.Status -eq 'Compliant' }).Count)" -ForegroundColor Green
+        Write-Host "Non-Compliant: $(($Results | Where-Object { $_.Status -eq 'Non-Compliant' }).Count)" -ForegroundColor Red
+        Write-Host "Non-Configured: $(($Results | Where-Object { $_.Status -eq 'Non-Configured' }).Count)" -ForegroundColor Cyan
+        Write-Host "Errors encountered: $(($Results | Where-Object { $_.Status -eq 'Error' }).Count)" -ForegroundColor DarkYellow
     } else {
         Write-Warning "No valid parameters were checked. No CSV file generated."
     }
