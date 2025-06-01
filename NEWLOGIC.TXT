@@ -1,0 +1,1220 @@
+<#
+.SYNOPSIS
+  Checks various hardcoded system parameters (registry, service, audit policy)
+  on a server and outputs the compliance status to a CSV file.
+
+.DESCRIPTION
+  This script automatically checks a comprehensive list of system settings
+  against their expected values. It leverages direct registry queries,
+  'Get-Service' for service states, and 'auditpol.exe' for audit policy settings.
+  The results, including the ISBL number, a descriptive parameter name (CIS Name),
+  the expected value, the current value found on the system, and a compliance
+  status (Compliant, Non-Compliant, Non-Configured, or Error), are written to a CSV file.
+
+.PARAMETER OutputCsvFile
+  An optional string that specifies the name of the CSV file where the results
+  will be saved. If not provided, it defaults to "RegistryComplianceReport.csv".
+
+.EXAMPLE
+  # Run the script to check all parameters and output to default CSV
+  .\Check-AllSystemCompliance.ps1
+
+.EXAMPLE
+  # Run the script and specify a custom output CSV file
+  .\Check-AllSystemCompliance.ps1 -OutputCsvFile "FullSystemComplianceReport.csv"
+
+.NOTES
+  - The script requires administrative privileges to access certain registry keys,
+    query service information, and run 'auditpol.exe'.
+  - The 'CIS Name' provides a more descriptive name for each parameter, derived
+    from common security benchmarks.
+  - 'Non-Configured' status indicates that either the expected registry path/value,
+    service, or audit policy subcategory was not found on the system.
+  - Some parameters from the provided lists were too vague or refer to settings
+    that require highly complex checks (e.g., specific ACLs, user rights assignments
+    beyond simple group membership, or browser-specific policies not directly
+    controlled by simple registry values) and have been noted as skipped within
+    the script's internal comments.
+#>
+param(
+    [Parameter(Mandatory=$false)]
+    [string]$OutputCsvFile = "RegistryComplianceReport.csv"
+)
+
+# Hardcoded system parameter mappings
+# Each entry includes:
+# - 'CIS Name': A descriptive name for the parameter.
+# - 'CheckType': Specifies the method to use for checking (e.g., "Registry", "Service", "AuditPol").
+# - 'Path' (for Registry): The full registry path.
+# - 'ValueName' (for Registry): The specific registry value name to check.
+# - 'ServiceDisplayName' (for Service): The display name of the service.
+# - 'ServiceName' (for Service): The actual service name (used by Get-Service).
+# - 'AuditCategory' (for AuditPol): The audit policy category.
+# - 'AuditSubcategory' (for AuditPol): The audit policy subcategory.
+# - 'ExpectedValue': The value that the setting should have for compliance.
+$SystemParameterMappings = @{
+    "ISBL-10564-01.009" = @{
+        "CIS Name"      = "Allow Administrator account lockout"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
+        "ValueName"     = "AllowAdminAccountLockout"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.043" = @{
+        "CIS Name"      = "Replace a process level token"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
+        "ValueName"     = "ReplaceProcessLevelToken"
+        "ExpectedValue" = "LOCAL SERVICE, NETWORK SERVICE"
+    }
+    "ISBL-10564-01.055" = @{
+        "CIS Name"      = "Domain member: Digitally encrypt secure channel data (when possible)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters"
+        "ValueName"     = "SealSecureChannel"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.064" = @{
+        "CIS Name"      = "Interactive logon: Message text for users attempting to log on"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        "ValueName"     = "LegalNoticeCaption"
+        "ExpectedValue" = "Your custom message title" # Placeholder, adjust if specific title is required
+    }
+    "ISBL-10564-01.065" = @{
+        "CIS Name"      = "Password Policy: Maximum password age"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        "ValueName"     = "MaximumPasswordAge"
+        "ExpectedValue" = "14"
+    }
+    "ISBL-10564-01.066" = @{
+        "CIS Name"      = "Interactive logon: Smart card removal behavior"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        "ValueName"     = "ScRemoveOption"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.073" = @{
+        "CIS Name"      = "Microsoft network server: Disconnect clients when logon hours expire"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\LanmanServer\Parameters"
+        "ValueName"     = "EnableForcedLogOff"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.074" = @{
+        "CIS Name"      = "Microsoft network server: Server SPN target name validation level"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\LanmanServer\Parameters"
+        "ValueName"     = "SmbServerNameHardeningLevel"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.079" = @{
+        "CIS Name"      = "Network access: Named Pipes that can be accessed anonymously"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\LanmanServer\Parameters"
+        "ValueName"     = "NullSessionPipes"
+        "ExpectedValue" = "" # Expects an empty string for no pipes
+    }
+    "ISBL-10564-01.087" = @{
+        "CIS Name"      = "Network access: Do not allow storage of credentials or .NET Passports for network authentication"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Control\Lsa"
+        "ValueName"     = "DisableDomainCreds"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.089" = @{
+        "CIS Name"      = "Network security: Force logoff when logon hours expire"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Control\Lsa"
+        "ValueName"     = "ForceLogoffWhenHourExpire"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.094" = @{
+        "CIS Name"      = "Network security: Restrict NTLM: Audit Incoming NTLM Traffic"
+        "CheckType"     = "AuditPol"
+        "AuditCategory"  = "System"
+        "AuditSubcategory" = "NTLM Authentication"
+        "ExpectedValue" = "Success,Failure" # auditpol.exe output format
+    }
+    "ISBL-10564-01.095" = @{
+        "CIS Name"      = "Network security: Restrict NTLM: Outgoing NTLM traffic"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Control\Lsa\MSV1_0"
+        "ValueName"     = "RestrictSendingNTLMTraffic"
+        "ExpectedValue" = "2"
+    }
+    "ISBL-10564-01.099" = @{
+        "CIS Name"      = "Windows Firewall: Domain: Firewall state"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\DomainProfile"
+        "ValueName"     = "EnableFirewall"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.100" = @{
+        "CIS Name"      = "Windows Firewall: Domain: Inbound connections"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\DomainProfile"
+        "ValueName"     = "DefaultInboundAction"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.102" = @{
+        "CIS Name"      = "Windows Firewall: Domain: Logging: Log file path"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging"
+        "ValueName"     = "LogFilePath"
+        "ExpectedValue" = "%SystemRoot%\\System32\\logfiles\\firewall\\domainfw.log"
+    }
+    "ISBL-10564-01.106" = @{
+        "CIS Name"      = "Windows Firewall: Private: Firewall state"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\PrivateProfile"
+        "ValueName"     = "EnableFirewall"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.109" = @{
+        "CIS Name"      = "Windows Firewall: Private: Logging: Log file path"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging"
+        "ValueName"     = "LogFilePath"
+        "ExpectedValue" = "%SystemRoot%\\System32\\logfiles\\firewall\\privatefw.log"
+    }
+    "ISBL-10564-01.112" = @{
+        "CIS Name"      = "Windows Firewall: Private: Logging: Log successful connections"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging"
+        "ValueName"     = "LogSuccessfulConnections"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.114" = @{
+        "CIS Name"      = "Windows Firewall: Public: Inbound connections"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\PublicProfile"
+        "ValueName"     = "DefaultInboundAction"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.118" = @{
+        "CIS Name"      = "Windows Firewall: Public: Logging: Log file path"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging"
+        "ValueName"     = "LogFilePath"
+        "ExpectedValue" = "%SystemRoot%\\System32\\logfiles\\firewall\\publicfw.log"
+    }
+    "ISBL-10564-01.127" = @{
+        "CIS Name"      = "Audit: Process creation"
+        "CheckType"     = "AuditPol"
+        "AuditCategory"  = "Detailed Tracking"
+        "AuditSubcategory" = "Process Creation"
+        "ExpectedValue" = "Success" # auditpol.exe output format
+    }
+    "ISBL-10564-01.145" = @{
+        "CIS Name"      = "Audit: Other System Events"
+        "CheckType"     = "AuditPol"
+        "AuditCategory"  = "System"
+        "AuditSubcategory" = "Other System Events"
+        "ExpectedValue" = "Success,Failure" # auditpol.exe output format
+    }
+    "ISBL-10564-01.152" = @{
+        "CIS Name"      = "User Account Control: Run all administrators in Admin Approval Mode"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        "ValueName"     = "LocalAccountTokenFilterPolicy"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.153" = @{
+        "CIS Name"      = "RPC endpoint mapper client authentication"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Rpc"
+        "ValueName"     = "EnableAuthEpResolution"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.156" = @{
+        "CIS Name"      = "Cryptography: Force strong key protection for user keys stored on the computer"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Cryptography"
+        "ValueName"     = "EnableCertPadding"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.158" = @{
+        "CIS Name"      = "NetBIOS node type"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\NetBT\Parameters"
+        "ValueName"     = "NodeType"
+        "ExpectedValue" = "2"
+    }
+    "ISBL-10564-01.159" = @{
+        "CIS Name"      = "WDigest Authentication"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Control\SecurityProviders\WDigest"
+        "ValueName"     = "UseLogonCredential"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.160" = @{
+        "CIS Name"      = "MSS: (AutoAdminLogon) Enable Automatic Logon"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "AutoAdminLogon"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.161" = @{
+        "CIS Name"      = "TCP/IP v4 Filtering: Enable source routing"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\Tcpip\Parameters"
+        "ValueName"     = "DisableIPSourceRouting"
+        "ExpectedValue" = "2"
+    }
+    "ISBL-10564-01.162" = @{
+        "CIS Name"      = "TCP/IP v6 Filtering: Enable source routing"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\Tcpip6\Parameters"
+        "ValueName"     = "DisableIPSourceRouting"
+        "ExpectedValue" = "2"
+    }
+    "ISBL-10564-01.164" = @{
+        "CIS Name"      = "NetBT: Allow the computer to ignore NetBIOS name release requests"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\NetBT\Parameters"
+        "ValueName"     = "NoNameReleaseOnDemand"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.165" = @{
+        "CIS Name"      = "User Account Control: Only elevate executables that are signed and validated"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+        "ValueName"     = "SafeDllSearchMode"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.166" = @{
+        "CIS Name"      = "Interactive logon: Machine inactivity limit"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        "ValueName"     = "ScreenSaverGracePeriod"
+        "ExpectedValue" = "5"
+    }
+    "ISBL-10564-01.167" = @{
+        "CIS Name"      = "DNS Client: Turn Off Multicast Name Resolution"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\DNSClient"
+        "ValueName"     = "EnableMulticast"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.169" = @{
+        "CIS Name"      = "DNS Client: Configure DNS over HTTPS (DoH) policy"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\DNSClient"
+        "ValueName"     = "EnableDoH"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.174" = @{
+        "CIS Name"      = "Network security: Hardened UNC Paths"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths"
+        "ValueName"     = "\\\\*\\NETLOGON"
+        "ExpectedValue" = "RequireMutualAuthentication=1, RequireIntegrity=1, RequirePrivacy=1"
+    }
+    "ISBL-10564-01.175" = @{
+        "CIS Name"      = "Minimize the number of simultaneous connections to the Internet or a Windows Domain"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WcmSvc\GroupPolicy"
+        "ValueName"     = "fMinimizeConnections"
+        "ExpectedValue" = "3"
+    }
+    "ISBL-10564-01.176" = @{
+        "CIS Name"      = "Configure Redirection Guard"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WcmSvc\GroupPolicy"
+        "ValueName"     = "EnableRedirectionGuard"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.177" = @{
+        "CIS Name"      = "RPC connection settings: Protocol to use for outgoing RPC connections"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Rpc"
+        "ValueName"     = "UseRpcTcp"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.178" = @{
+        "CIS Name"      = "RPC connection settings: Use authentication for outgoing RPC connections"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Rpc"
+        "ValueName"     = "UseRpcAuth"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.179" = @{
+        "CIS Name"      = "RPC listener settings: Protocols to allow for incoming RPC connections"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Rpc"
+        "ValueName"     = "UseRpcTcp"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.180" = @{
+        "CIS Name"      = "RPC listener settings: Authentication protocol to use for incoming RPC connections"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Rpc"
+        "ValueName"     = "UseRpcAuth"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.181" = @{
+        "CIS Name"      = "Configure RPC over TCP port"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Rpc"
+        "ValueName"     = "RpcTcpPort"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.182" = @{
+        "CIS Name"      = "Limits print driver installation to Administrators"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Printers"
+        "ValueName"     = "RestrictDriverInstallationToAdministrators"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.183" = @{
+        "CIS Name"      = "Manage processing of Queue-specific files"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Printers"
+        "ValueName"     = "LimitQueueSpecificFiles"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.184" = @{
+        "CIS Name"      = "Point and Print Restrictions: When installing drivers for a new connection"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Printers"
+        "ValueName"     = "PointAndPrintRestrictions"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.185" = @{
+        "CIS Name"      = "Point and Print Restrictions: When updating drivers for an existing connection"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Printers"
+        "ValueName"     = "PointAndPrintRestrictions_Users" # Adjusted value name if it's different from 184
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.187" = @{
+        "CIS Name"      = "Encryption Oracle Remediation"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Rpc"
+        "ValueName"     = "EnableEncryptionOracleRemediation"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.188" = @{
+        "CIS Name"      = "Remote host allows delegation of non-exportable credentials"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Rpc"
+        "ValueName"     = "AllowDelegationOfNonExportableCredentials"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.189" = @{
+        "CIS Name"      = "Prevent device metadata retrieval from the Internet"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\DeviceInstall\Settings"
+        "ValueName"     = "PreventDeviceMetadataRetrieval"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.190" = @{
+        "CIS Name"      = "Boot-Start Driver Initialization Policy"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Control\BootVerificationProgram"
+        "ValueName"     = "BootDriverInitializationPolicy"
+        "ExpectedValue" = "3"
+    }
+    "ISBL-10564-01.193" = @{
+        "CIS Name"      = "Configure security policy processing: Do not apply during periodic background processing"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\System"
+        "ValueName"     = "DisableSecurityPolicyProcessing"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.194" = @{
+        "CIS Name"      = "Configure security policy processing: Process even if the Group Policy objects have not changed"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\System"
+        "ValueName"     = "ProcessGroupPolicyEvenIfNoChange"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.197" = @{
+        "CIS Name"      = "Turn off downloading of print drivers over HTTP"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Printers"
+        "ValueName"     = "DisableHttpPrintDriverDownload"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.199" = @{
+        "CIS Name"      = "Enumeration policy for external devices incompatible with Kernel DMA Protection"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\DeviceInstall\Restrictions"
+        "ValueName"     = "DmaProtectionEnumerationPolicy"
+        "ExpectedValue" = "3"
+    }
+    "ISBL-10564-01.200" = @{
+        "CIS Name"      = "Allow Custom SSPs and APs to be loaded into LSASS"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Control\Lsa"
+        "ValueName"     = "AllowCustomSSPs"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.201" = @{
+        "CIS Name"      = "Block user from showing account details on sign-in"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        "ValueName"     = "BlockUserShowingAccountDetails"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.202" = @{
+        "CIS Name"      = "Do not display network selection UI"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\System"
+        "ValueName"     = "NoNetworkSelectionUI"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.206" = @{
+        "CIS Name"      = "Turn off picture password sign-in"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Personalization"
+        "ValueName"     = "NoPicturePassword"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.208" = @{
+        "CIS Name"      = "Require a password when a computer wakes (on battery)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\0012ee47-9041-4b5d-9b77-535fba8b1442"
+        "ValueName"     = "ACSettingIndex"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.209" = @{
+        "CIS Name"      = "Require a password when a computer wakes (plugged in)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\0012ee47-9041-4b5d-9b77-535fba8b1442"
+        "ValueName"     = "DCSettingIndex"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.213" = @{
+        "CIS Name"      = "Enable Windows NTP Server"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\W32Time\Parameters"
+        "ValueName"     = "LocalNTP"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.214" = @{
+        "CIS Name"      = "Allow Microsoft accounts to be optional"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        "ValueName"     = "MSAOptional"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.215" = @{
+        "CIS Name"      = "Disallow Autoplay for non-volume devices"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+        "ValueName"     = "NoDriveTypeAutoRun"
+        "ExpectedValue" = "255"
+    }
+    "ISBL-10564-01.216" = @{
+        "CIS Name"      = "Set the default behavior for AutoRun"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+        "ValueName"     = "NoAutorun"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.219" = @{
+        "CIS Name"      = "Turn off cloud consumer account state content"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\CloudContent"
+        "ValueName"     = "DisableCloudAccountState"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.220" = @{
+        "CIS Name"      = "Turn off Microsoft consumer experiences"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\CloudContent"
+        "ValueName"     = "DisableWindowsConsumerFeatures"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.223" = @{
+        "CIS Name"      = "Enumerate administrator accounts on elevation"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        "ValueName"     = "FilterAdministratorToken"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.224" = @{
+        "CIS Name"      = "Allow Diagnostic Data"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\DataCollection"
+        "ValueName"     = "AllowTelemetry"
+        "ExpectedValue" = "0" # Choosing the more restrictive compliant value
+    }
+    "ISBL-10564-01.225" = @{
+        "CIS Name"      = "Disable OneSettings Downloads"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\OneSettings"
+        "ValueName"     = "DisableDownloads"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.226" = @{
+        "CIS Name"      = "Do not show feedback notifications"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Feedback"
+        "ValueName"     = "NoFeedbackNotifications"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.227" = @{
+        "CIS Name"      = "Enable OneSettings Auditing"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\OneSettings"
+        "ValueName"     = "EnableAuditing"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.228" = @{
+        "CIS Name"      = "Limit Diagnostic Log Collection"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\DataCollection"
+        "ValueName"     = "LimitDiagnosticLogCollection"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.229" = @{
+        "CIS Name"      = "Limit Dump Collection"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\DataCollection"
+        "ValueName"     = "LimitDumpCollection"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.230" = @{
+        "CIS Name"      = "Toggle user control over Insider builds"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        "ValueName"     = "DisableInsiderBuilds"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.231" = @{
+        "CIS Name"      = "Enable App Installer"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\AppInstaller"
+        "ValueName"     = "EnableAppInstaller"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.232" = @{
+        "CIS Name"      = "Enable App Installer Experimental Features"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\AppInstaller"
+        "ValueName"     = "EnableExperimentalFeatures"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.233" = @{
+        "CIS Name"      = "Enable App Installer Hash Override"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\AppInstaller"
+        "ValueName"     = "EnableHashOverride"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.234" = @{
+        "CIS Name"      = "Enable App Installer ms-appinstaller protocol"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\AppInstaller"
+        "ValueName"     = "EnableMSAppInstallerProtocol"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.238" = @{
+        "CIS Name"      = "Security: Specify the maximum log file size (KB)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\EventLog\Security"
+        "ValueName"     = "MaxSize"
+        "ExpectedValue" = "196608"
+    }
+    "ISBL-10564-01.240" = @{
+        "CIS Name"      = "Setup: Specify the maximum log file size (KB)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\EventLog\Setup"
+        "ValueName"     = "MaxSize"
+        "ExpectedValue" = "32768"
+    }
+    "ISBL-10564-01.241" = @{
+        "CIS Name"      = "System: Control Event Log behavior when the log file reaches its maximum size"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\EventLog\System"
+        "ValueName"     = "Retention"
+        "ExpectedValue" = "0" # Assuming 0 for disabled/overwrite as needed
+    }
+    "ISBL-10564-01.242" = @{
+        "CIS Name"      = "System: Specify the maximum log file size (KB)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\EventLog\System"
+        "ValueName"     = "MaxSize"
+        "ExpectedValue" = "32768"
+    }
+    "ISBL-10564-01.246" = @{
+        "CIS Name"      = "Block all consumer Microsoft account user authentication"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\CloudContent"
+        "ValueName"     = "BlockMSAAuthentication"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.247" = @{
+        "CIS Name"      = "Configure local setting override for reporting to Microsoft MAPS"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows Defender\Spynet"
+        "ValueName"     = "DisableLocalOverride"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.248" = @{
+        "CIS Name"      = "Prevent the usage of OneDrive for file storage"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"
+        "ValueName"     = "DisableFileSync"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.249" = @{
+        "CIS Name"      = "Do not allow passwords to be saved"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Credentials"
+        "ValueName"     = "DisablePasswordSaving"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.250" = @{
+        "CIS Name"      = "Do not allow drive redirection"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services"
+        "ValueName"     = "fDisableCdm"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.251" = @{
+        "CIS Name"      = "Always prompt for password upon connection"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services"
+        "ValueName"     = "fPromptForPassword"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.252" = @{
+        "CIS Name"      = "Require secure RPC communication"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Rpc"
+        "ValueName"     = "EnableAuthEpResolution" # Reusing existing value name, assuming it covers this broader policy
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.255" = @{
+        "CIS Name"      = "Do not use temporary folders per session"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services"
+        "ValueName"     = "fUseTemporaryFolders"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.258" = @{
+        "CIS Name"      = "Allow Windows Ink Workspace"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsInkWorkspace"
+        "ValueName"     = "AllowInkWorkspace"
+        "ExpectedValue" = "0" # Choosing Disabled for simplicity
+    }
+    "ISBL-10564-01.260" = @{
+        "CIS Name"      = "Always install with elevated privileges (Computer Configuration)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Installer"
+        "ValueName"     = "AlwaysInstallElevated"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.261" = @{
+        "CIS Name"      = "Enable MPR notifications for the system"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\System"
+        "ValueName"     = "EnableMPRNotifications"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.263" = @{
+        "CIS Name"      = "Client: Allow Basic authentication (WinRM)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WinRM\Client"
+        "ValueName"     = "AllowBasic"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.264" = @{
+        "CIS Name"      = "Client: Allow unencrypted traffic (WinRM)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WinRM\Client"
+        "ValueName"     = "AllowUnencrypted"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.266" = @{
+        "CIS Name"      = "Service: Allow Basic authentication (WinRM)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WinRM\Service"
+        "ValueName"     = "AllowBasic"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.267" = @{
+        "CIS Name"      = "Service: Allow unencrypted traffic (WinRM)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WinRM\Service"
+        "ValueName"     = "AllowUnencrypted"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.269" = @{
+        "CIS Name"      = "Prevent users from modifying settings (Control Panel)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Explorer"
+        "ValueName"     = "NoControlPanel"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.270" = @{
+        "CIS Name"      = "Configure Automatic Updates"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        "ValueName"     = "NoAutoUpdate"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.271" = @{
+        "CIS Name"      = "Configure Automatic Updates: Scheduled install day"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        "ValueName"     = "ScheduledInstallDay"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.272" = @{
+        "CIS Name"      = "Manage preview builds"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        "ValueName"     = "NoPreviewBuilds"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.273" = @{
+        "CIS Name"      = "Turn off toast notifications on the lock screen"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        "ValueName"     = "NoToastNotifications"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.274" = @{
+        "CIS Name"      = "Do not preserve zone information in file attachments"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        "ValueName"     = "NoZoneInformation"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.275" = @{
+        "CIS Name"      = "Configure Windows spotlight on lock screen"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        "ValueName"     = "NoWindowsSpotlight"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.279" = @{
+        "CIS Name"      = "Always install with elevated privileges (User Configuration)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Installer"
+        "ValueName"     = "AlwaysInstallElevated"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.280" = @{
+        "CIS Name"      = "Reset account lockout counter after"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        "ValueName"     = "ResetLockoutCount"
+        "ExpectedValue" = "5"
+    }
+    "ISBL-10564-01.283" = @{
+        "CIS Name"      = "Password never expires check box for LocalGuest"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "PasswordNeverExpires"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.284" = @{
+        "CIS Name"      = "Administrative Access: BuiltinAdministrators"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "BuiltinAdministrators"
+        "ExpectedValue" = "PRV_SEC_FA_SRV_VATWS, PRV_EAM_AA_SRV_IDM_Server_Admins, PRV_ECO_FA_SRV_SERVNOW"
+    }
+    "ISBL-10564-01.292" = @{
+        "CIS Name"      = "Private Profile: Windows Firewall - Apply local firewall rules"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\PrivateProfile"
+        "ValueName"     = "ApplyLocalFirewallRules"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.293" = @{
+        "CIS Name"      = "Private Profile: Windows Firewall - Apply local connection security rules"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\PrivateProfile"
+        "ValueName"     = "ApplyLocalConnectionSecurityRules"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.298" = @{
+        "CIS Name"      = "Disable WINS entries for IP addresses"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\DNSClient"
+        "ValueName"     = "DisableWINS"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.300" = @{
+        "CIS Name"      = "Systems Settings: Optional Subsystems"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "OptionalSubsystems"
+        "ExpectedValue" = "" # Expects an empty string for no optional subsystems
+    }
+    "ISBL-10564-01.307" = @{
+        "CIS Name"      = "Recovery console: Allow automatic administrative logon"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "AllowAutoAdminLogon"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.310" = @{
+        "CIS Name"      = "Bypass traverse checking"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "BypassTraverseChecking"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.317" = @{
+        "CIS Name"      = "Windows Firewall: Allow logging"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\PrivateProfile"
+        "ValueName"     = "AllowLogging"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.326" = @{
+        "CIS Name"      = "DHCP Server services"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "DHCPServer"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.331" = @{
+        "CIS Name"      = "Remote Access Auto Connection Manager"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "RemoteAccessAutoConnectionManager"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.332" = @{
+        "CIS Name"      = "Remote Access Connection Manager"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "RemoteAccessConnectionManager"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.336" = @{
+        "CIS Name"      = "Telephony service"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        "ValueName"     = "Telephony"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.337" = @{
+        "CIS Name"      = "Telnet Server service"
+        "CheckType"     = "Service"
+        "ServiceName"   = "TlntSvr"
+        "ExpectedValue" = "Disabled" # Can be "Running", "Stopped", "Disabled", "Automatic" etc.
+    }
+    "ISBL-10564-01.338" = @{
+        "CIS Name"      = "Windows Event Log service"
+        "CheckType"     = "Service"
+        "ServiceName"   = "EventLog"
+        "ExpectedValue" = "Running,Automatic" # Expected status and start type
+    }
+    "ISBL-10564-01.344" = @{
+        "CIS Name"      = "Wallet Service"
+        "CheckType"     = "Service"
+        "ServiceName"   = "WalletService"
+        "ExpectedValue" = "Disabled"
+    }
+    "ISBL-10564-01.351" = @{
+        "CIS Name"      = "Connected User Experiences and Telemetry (Diagtrack) service"
+        "CheckType"     = "Service"
+        "ServiceName"   = "DiagTrack"
+        "ExpectedValue" = "Disabled"
+    }
+    "ISBL-10564-01.352" = @{
+        "CIS Name"      = "Simple Mail Transfer Protocol (SMTPSVC) service"
+        "CheckType"     = "Service"
+        "ServiceName"   = "SMTPSVC"
+        "ExpectedValue" = "Disabled"
+    }
+    # ISBL-10564-01.363: "USB Drive Access" - Too vague for a direct registry/service/auditpol check without more info. Skipping.
+    "ISBL-10564-01.365" = @{
+        "CIS Name"      = "Block launching Windows Store apps with Windows Runtime API access from hosted content"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Appx"
+        "ValueName"     = "DisableWindowsRuntimeAccess"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.366" = @{
+        "CIS Name"      = "Allow Telemetry"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\DataCollection"
+        "ValueName"     = "AllowTelemetry"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.367" = @{
+        "CIS Name"      = "Configure Windows Defender SmartScreen"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows Defender\SmartScreen"
+        "ValueName"     = "Enabled"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.369" = @{
+        "CIS Name"      = "Do not allow COM port redirection"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services\Client\PortRedirector"
+        "ValueName"     = "fDisableCpm"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.370" = @{
+        "CIS Name"      = "Do not allow supported Plug and Play device redirection"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services\Client\PnpRedirector"
+        "ValueName"     = "fDisablePnp"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.375" = @{
+        "CIS Name"      = "Allow Cortana"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Windows Search"
+        "ValueName"     = "AllowCortana"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.376" = @{
+        "CIS Name"      = "Allow Cortana above lock screen"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Windows Search"
+        "ValueName"     = "AllowCortanaAboveLock"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.377" = @{
+        "CIS Name"      = "Allow search and Cortana to use location"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Windows Search"
+        "ValueName"     = "AllowLocation"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.380" = @{
+        "CIS Name"      = "Disable all apps from Windows Store"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\WindowsStore"
+        "ValueName"     = "DisableStoreApps"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.381" = @{
+        "CIS Name"      = "Turn off Microsoft Defender AntiVirus"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows Defender"
+        "ValueName"     = "DisableAntiSpyware"
+        "ExpectedValue" = "1"
+    }
+    "ISBL-10564-01.383" = @{
+        "CIS Name"      = "Join Microsoft MAPS"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows Defender\Spynet"
+        "ValueName"     = "SpyNetReporting"
+        "ExpectedValue" = "0"
+    }
+    "ISBL-10564-01.384" = @{
+        "CIS Name"      = "Send file samples when further analysis is required"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows Defender\Spynet"
+        "ValueName"     = "SubmitSamplesConsent"
+        "ExpectedValue" = "2"
+    }
+    "ISBL-10564-01.386" = @{
+        "CIS Name"      = "Configure Watson events (Error Reporting)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\Windows Error Reporting"
+        "ValueName"     = "Disabled"
+        "ExpectedValue" = "1"
+    }
+    # ISBL-10564-01.387, 388, 389, 390: PowerShell Log settings - These require more specific registry paths for event log sizes and ACLs, or direct ACL checks which are complex. Skipping for now.
+    "ISBL-10564-01.394" = @{
+        "CIS Name"      = "Turn on Module Logging (PowerShell)"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\ModuleLogging"
+        "ValueName"     = "EnableModuleLogging"
+        "ExpectedValue" = "1"
+    }
+    # ISBL-10564-01.396: "Browser Proxy Lockdown" - Browser specific setting, too vague for a general registry check. Skipping.
+    # ISBL-10564-01.440: "Logon as a Service" - This is a User Right Assignment, not a direct registry value. Requires different cmdlets (e.g., secedit /export or specific WMI queries for user rights). Skipping.
+    # ISBL-10564-01.441: "disable Machine Configuration" - Too vague. Skipping.
+    # ISBL-10564-01.442: "disable ExtensionService" - Too vague. Skipping.
+}
+
+# Array to store the results
+$Results = @()
+
+# Get all parameter numbers from the hardcoded mappings
+$AllParameterNumbers = $SystemParameterMappings.Keys | Sort-Object
+
+Write-Host "Starting system parameter compliance check for all defined parameters..."
+
+# --- AuditPol.exe Parsing Function ---
+function Get-AuditPolicySetting {
+    param(
+        [string]$Category,
+        [string]$Subcategory
+    )
+    $AuditPolOutput = & "$env:SystemRoot\system32\auditpol.exe" /get /category:$Category /r 2>&1
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to run auditpol.exe for category '$Category'. Error: $($AuditPolOutput | Out-String)"
+        return $null
+    }
+
+    # Parse the output to find the specific subcategory
+    # The output format is typically: "Category;Subcategory;Exclusion;Success;Failure"
+    # Or for /r: "System access;Non-audited;Failure;Success"
+    $Pattern = [regex]::Escape($Subcategory) + ";(.*?);(.*?);(.*?)$"
+    $Match = $AuditPolOutput | Select-String -Pattern $Pattern | Select-Object -First 1
+
+    if ($Match) {
+        $Line = $Match.ToString()
+        $Parts = $Line.Split(';')
+        if ($Parts.Count -ge 4) {
+            $Success = $Parts[3].Trim()
+            $Failure = $Parts[4].Trim()
+            # Combine Success and Failure into a consistent string for comparison
+            if ($Success -eq "Success" -and $Failure -eq "Failure") {
+                return "Success,Failure"
+            } elseif ($Success -eq "Success") {
+                return "Success"
+            } elseif ($Failure -eq "Failure") {
+                return "Failure"
+            } else {
+                return "No Auditing" # Or whatever makes sense if neither is set
+            }
+        }
+    }
+    return $null # Subcategory not found or unexpected format
+}
+
+
+# Process each defined parameter
+foreach ($ParamNumber in $AllParameterNumbers) {
+    $Mapping = $SystemParameterMappings[$ParamNumber]
+    $CISName = $Mapping."CIS Name"
+    $CheckType = $Mapping.CheckType
+    $ExpectedValue = $Mapping.ExpectedValue
+    $CurrentValue = "N/A"
+    $Status = "Non-Configured"
+    $Detail = "" # For additional info like registry path or service name
+
+    Write-Host "Checking [$ParamNumber] - '$CISName'"
+
+    try {
+        switch ($CheckType) {
+            "Registry" {
+                $RegistryPath = $Mapping.Path
+                $ValueName = $Mapping.ValueName
+                $Detail = "Registry Path: $RegistryPath, Value Name: $ValueName"
+
+                if (Test-Path -Path $RegistryPath) {
+                    $RegProperty = Get-ItemProperty -Path $RegistryPath -Name $ValueName -ErrorAction SilentlyContinue
+
+                    if ($null -ne $RegProperty -and $RegProperty.PSObject.Properties.Name -contains $ValueName) {
+                        if ($RegProperty.$ValueName -is [array]) {
+                            $CurrentValue = ($RegProperty.$ValueName | ForEach-Object { $_.ToString() }) -join ", "
+                        } else {
+                            $CurrentValue = $RegProperty.$ValueName.ToString()
+                        }
+
+                        if ($CurrentValue -eq $ExpectedValue) {
+                            $Status = "Compliant"
+                        } else {
+                            $Status = "Non-Compliant"
+                        }
+                    } else {
+                        $CurrentValue = "Value Not Found"
+                        $Status = "Non-Configured"
+                    }
+                } else {
+                    $CurrentValue = "Path Not Found"
+                    $Status = "Non-Configured"
+                }
+            }
+            "Service" {
+                $ServiceName = $Mapping.ServiceName
+                $ExpectedStatus = $ExpectedValue.Split(',')[0].Trim()
+                $ExpectedStartType = if ($ExpectedValue.Split(',').Count -gt 1) { $ExpectedValue.Split(',')[1].Trim() } else { $null }
+                $Detail = "Service Name: $ServiceName"
+
+                $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+
+                if ($Service) {
+                    $CurrentStatus = $Service.Status.ToString()
+                    $CurrentStartType = $Service.StartType.ToString()
+
+                    $CurrentValue = $CurrentStatus
+                    if ($ExpectedStartType) {
+                        $CurrentValue += ",$CurrentStartType"
+                    }
+
+                    $IsStatusCompliant = ($CurrentStatus -eq $ExpectedStatus)
+                    $IsStartTypeCompliant = if ($ExpectedStartType) { $CurrentStartType -eq $ExpectedStartType } else { $true }
+
+                    if ($IsStatusCompliant -and $IsStartTypeCompliant) {
+                        $Status = "Compliant"
+                    } else {
+                        $Status = "Non-Compliant"
+                    }
+                } else {
+                    $CurrentValue = "Service Not Found"
+                    $Status = "Non-Configured"
+                }
+            }
+            "AuditPol" {
+                $AuditCategory = $Mapping.AuditCategory
+                $AuditSubcategory = $Mapping.AuditSubcategory
+                $Detail = "Audit Category: $AuditCategory, Subcategory: $AuditSubcategory"
+
+                $CurrentValue = Get-AuditPolicySetting -Category $AuditCategory -Subcategory $AuditSubcategory
+
+                if ($null -ne $CurrentValue) {
+                    if ($CurrentValue -eq $ExpectedValue) {
+                        $Status = "Compliant"
+                    } else {
+                        $Status = "Non-Compliant"
+                    }
+                } else {
+                    $CurrentValue = "Audit Setting Not Found/Parse Error"
+                    $Status = "Non-Configured"
+                }
+            }
+            default {
+                $CurrentValue = "Unsupported CheckType: $($CheckType)"
+                $Status = "Error"
+            }
+        }
+    }
+    catch {
+        $CurrentValue = "Error: $($_.Exception.Message)"
+        $Status = "Error"
+    }
+
+    # Create a custom object for the current result and add it to the results array
+    $ResultObject = [PSCustomObject]@{
+        "ISBL Number"    = $ParamNumber
+        "Parameter Name" = $CISName
+        "Expected Value" = $ExpectedValue
+        "Current Value"  = $CurrentValue
+        "Status"         = $Status
+        "Details"        = $Detail # Add details for easier debugging/understanding
+    }
+    $Results += $ResultObject
+}
+
+# Export the results to a CSV file
+try {
+    if ($Results.Count -gt 0) {
+        $Results | Export-Csv -Path $OutputCsvFile -NoTypeInformation -Encoding UTF8
+
+        Write-Host "`nSystem compliance report saved to '$OutputCsvFile'"
+        # Corrected way to get counts, ensuring 0 is displayed for empty categories
+        Write-Host "Total checks performed: $($Results.Count)"
+        Write-Host "Compliant: $(($Results | Where-Object { $_.Status -eq 'Compliant' }).Count)"
+        Write-Host "Non-Compliant: $(($Results | Where-Object { $_.Status -eq 'Non-Compliant' }).Count)"
+        Write-Host "Non-Configured: $(($Results | Where-Object { $_.Status -eq 'Non-Configured' }).Count)"
+        Write-Host "Errors encountered: $(($Results | Where-Object { $_.Status -eq 'Error' }).Count)"
+    } else {
+        Write-Warning "No valid parameters were checked. No CSV file generated."
+    }
+}
+catch {
+    Write-Error "Failed to export CSV file '$OutputCsvFile': $($_.Exception.Message)"
+}
