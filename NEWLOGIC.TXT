@@ -1,12 +1,13 @@
 <#
 .SYNOPSIS
-  Checks various hardcoded system parameters (registry, service, audit policy)
+  Checks various hardcoded system parameters (registry, service, audit policy, secedit)
   on a server and outputs the compliance status to a CSV file.
 
 .DESCRIPTION
   This script automatically checks a comprehensive list of system settings
   against their expected values. It leverages direct registry queries,
-  'Get-Service' for service states, and 'auditpol.exe' for audit policy settings.
+  'Get-Service' for service states, 'auditpol.exe' for audit policy settings,
+  and 'secedit /export' for local security policy settings.
   The results, including the ISBL number, a descriptive parameter name (CIS Name),
   the expected value, the current value found on the system, and a compliance
   status (Compliant, Non-Compliant, Non-Configured, or Error), are written to a CSV file.
@@ -25,11 +26,11 @@
 
 .NOTES
   - The script requires administrative privileges to access certain registry keys,
-    query service information, and run 'auditpol.exe'.
+    query service information, and run 'auditpol.exe' and 'secedit.exe'.
   - The 'CIS Name' provides a more descriptive name for each parameter, derived
     from common security benchmarks.
   - 'Non-Configured' status indicates that either the expected registry path/value,
-    service, or audit policy subcategory was not found on the system.
+    service, audit policy subcategory, or secedit setting was not found on the system.
   - Some parameters from the provided lists were too vague or refer to settings
     that require highly complex checks (e.g., specific ACLs, user rights assignments
     beyond simple group membership, or browser-specific policies not directly
@@ -44,13 +45,15 @@ param(
 # Hardcoded system parameter mappings
 # Each entry includes:
 # - 'CIS Name': A descriptive name for the parameter.
-# - 'CheckType': Specifies the method to use for checking (e.g., "Registry", "Service", "AuditPol").
+# - 'CheckType': Specifies the method to use for checking (e.g., "Registry", "Service", "AuditPol", "Secedit").
 # - 'Path' (for Registry): The full registry path.
 # - 'ValueName' (for Registry): The specific registry value name to check.
 # - 'ServiceDisplayName' (for Service): The display name of the service.
 # - 'ServiceName' (for Service): The actual service name (used by Get-Service).
 # - 'AuditCategory' (for AuditPol): The audit policy category.
 # - 'AuditSubcategory' (for AuditPol): The audit policy subcategory.
+# - 'SeceditSection' (for Secedit): The section name in the secedit export (e.g., "Privilege Rights").
+# - 'SeceditKey' (for Secedit): The key name within the secedit section (e.g., "SeServiceLogonRight").
 # - 'ExpectedValue': The value that the setting should have for compliance.
 $SystemParameterMappings = @{
     "ISBL-10564-01.009" = @{
@@ -131,7 +134,7 @@ $SystemParameterMappings = @{
         "ExpectedValue" = "1"
     }
     "ISBL-10564-01.094" = @{
-        "CIS Name"      = "Network security: Restrict NTLM: Audit Incoming NTLM Traffic"
+        "CIS Name"      = "Network security: Audit NTLM authentication in this domain"
         "CheckType"     = "AuditPol"
         "AuditCategory"  = "System"
         "AuditSubcategory" = "NTLM Authentication"
@@ -1022,7 +1025,14 @@ $SystemParameterMappings = @{
         "ValueName"     = "Disabled"
         "ExpectedValue" = "1"
     }
-    # ISBL-10564-01.387, 388, 389, 390: PowerShell Log settings - These require more specific registry paths for event log sizes and ACLs, or direct ACL checks which are complex. Skipping for now.
+    "ISBL-10564-01.387" = @{
+        "CIS Name"      = "Maximum log file size for PowerShell Logs"
+        "CheckType"     = "Registry"
+        "Path"          = "HKLM:\System\CurrentControlSet\Services\EventLog\Windows PowerShell"
+        "ValueName"     = "MaxSize"
+        "ExpectedValue" = "32768" # Common default, adjust if specific value is needed
+    }
+    # ISBL-10564-01.388, 389, 390: PowerShell Log settings - These require more specific registry paths for event log sizes and ACLs, or direct ACL checks which are complex. Skipping for now.
     "ISBL-10564-01.394" = @{
         "CIS Name"      = "Turn on Module Logging (PowerShell)"
         "CheckType"     = "Registry"
@@ -1031,7 +1041,13 @@ $SystemParameterMappings = @{
         "ExpectedValue" = "1"
     }
     # ISBL-10564-01.396: "Browser Proxy Lockdown" - Browser specific setting, too vague for a general registry check. Skipping.
-    # ISBL-10564-01.440: "Logon as a Service" - This is a User Right Assignment, not a direct registry value. Requires different cmdlets (e.g., secedit /export or specific WMI queries for user rights). Skipping.
+    "ISBL-10564-01.440" = @{
+        "CIS Name"      = "Logon as a Service"
+        "CheckType"     = "Secedit"
+        "SeceditSection" = "Privilege Rights"
+        "SeceditKey"    = "SeServiceLogonRight"
+        "ExpectedValue" = "*S-1-5-80-0" # NT SERVICE SID, common for this right. Adjust if specific SIDs are expected.
+    }
     # ISBL-10564-01.441: "disable Machine Configuration" - Too vague. Skipping.
     # ISBL-10564-01.442: "disable ExtensionService" - Too vague. Skipping.
 }
@@ -1084,6 +1100,60 @@ function Get-AuditPolicySetting {
     return $null # Subcategory not found or unexpected format
 }
 
+# --- Secedit.exe Parsing Function ---
+function Get-SeceditSetting {
+    param(
+        [string]$Section,
+        [string]$Key
+    )
+    $TempSeceditFile = Join-Path $env:TEMP "secedit_export_$((Get-Random).ToString()).inf"
+    try {
+        # Export the security policy settings
+        $SeceditOutput = & secedit /export /cfg "$TempSeceditFile" /quiet 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Failed to export security policy using secedit.exe. Error: $($SeceditOutput | Out-String)"
+            return $null
+        }
+
+        # Read the content of the exported file
+        $Content = Get-Content -Path $TempSeceditFile -ErrorAction SilentlyContinue
+
+        if (-not $Content) {
+            Write-Warning "Secedit export file '$TempSeceditFile' is empty or could not be read."
+            return $null
+        }
+
+        # Find the section and then the key
+        $InDesiredSection = $false
+        foreach ($line in $Content) {
+            if ($line.Trim() -eq "[$Section]") {
+                $InDesiredSection = $true
+                continue
+            }
+            if ($line.Trim().StartsWith("[") -and $line.Trim().EndsWith("]")) {
+                # Entered a new section, so we are no longer in the desired one
+                $InDesiredSection = $false
+            }
+
+            if ($InDesiredSection) {
+                if ($line -match "^$([regex]::Escape($Key))\s*=\s*(.*)$") {
+                    return $Matches[1].Trim()
+                }
+            }
+        }
+    }
+    catch {
+        Write-Warning "Error during secedit check: $($_.Exception.Message)"
+    }
+    finally {
+        # Clean up the temporary file
+        if (Test-Path $TempSeceditFile) {
+            Remove-Item $TempSeceditFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $null # Setting not found or error
+}
+
 
 # Process each defined parameter
 foreach ($ParamNumber in $AllParameterNumbers) {
@@ -1130,8 +1200,10 @@ foreach ($ParamNumber in $AllParameterNumbers) {
             }
             "Service" {
                 $ServiceName = $Mapping.ServiceName
-                $ExpectedStatus = $ExpectedValue.Split(',')[0].Trim()
-                $ExpectedStartType = if ($ExpectedValue.Split(',').Count -gt 1) { $ExpectedValue.Split(',')[1].Trim() } else { $null }
+                # ExpectedValue can be "Disabled", "Running,Automatic", etc.
+                $ExpectedParts = $ExpectedValue.Split(',') | ForEach-Object { $_.Trim() }
+                $ExpectedStatus = $ExpectedParts[0]
+                $ExpectedStartType = if ($ExpectedParts.Count -gt 1) { $ExpectedParts[1] } else { $null }
                 $Detail = "Service Name: $ServiceName"
 
                 $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
@@ -1173,6 +1245,44 @@ foreach ($ParamNumber in $AllParameterNumbers) {
                     }
                 } else {
                     $CurrentValue = "Audit Setting Not Found/Parse Error"
+                    $Status = "Non-Configured"
+                }
+            }
+            "Secedit" {
+                $SeceditSection = $Mapping.SeceditSection
+                $SeceditKey = $Mapping.SeceditKey
+                $Detail = "Secedit Section: $SeceditSection, Key: $SeceditKey"
+
+                $CurrentValue = Get-SeceditSetting -Section $SeceditSection -Key $SeceditKey
+
+                if ($null -ne $CurrentValue) {
+                    # Secedit export for user rights often lists SIDs.
+                    # Compare if the expected SID is present in the actual value.
+                    # This assumes ExpectedValue is a single SID or a comma-separated list of SIDs.
+                    $ExpectedSIDs = $ExpectedValue.Split(',') | ForEach-Object { $_.Trim() }
+                    $CurrentSIDs = $CurrentValue.Split(',') | ForEach-Object { $_.Trim() }
+
+                    # Check if all expected SIDs are present in the current SIDs
+                    $AllExpectedSIDsFound = $true
+                    foreach ($expectedSid in $ExpectedSIDs) {
+                        if ($CurrentSIDs -notcontains $expectedSid) {
+                            $AllExpectedSIDsFound = $false
+                            break
+                        }
+                    }
+
+                    if ($AllExpectedSIDsFound -and ($CurrentSIDs.Count -eq $ExpectedSIDs.Count)) {
+                        # Exact match of SIDs and count
+                        $Status = "Compliant"
+                    } elseif ($AllExpectedSIDsFound -and ($CurrentSIDs.Count -gt $ExpectedSIDs.Count)) {
+                        # Expected SIDs are present, but there are additional SIDs.
+                        # This might be compliant depending on policy, but flagging as non-compliant for strictness.
+                        $Status = "Non-Compliant (Additional SIDs Present)"
+                    } else {
+                        $Status = "Non-Compliant"
+                    }
+                } else {
+                    $CurrentValue = "Secedit Setting Not Found/Parse Error"
                     $Status = "Non-Configured"
                 }
             }
